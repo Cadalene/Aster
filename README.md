@@ -22,7 +22,7 @@ Aster 是一个面向等保测评现场的离线取证工具，用于在手机�
 
 ## 使用方式
 
-1. 安装 [`release/Aster-v1.4.3-paper-blue-default-release.apk`](release/Aster-v1.4.3-paper-blue-default-release.apk)。
+1. 安装包位于 release 中。
 2. 在 App 中创建项目，然后添加设备并选择对应的设备类型模板。
 3. 进入取证项拍照或填写备注，记录会在操作后即时保存。
 4. 在项目页面导出 Word、项目浏览包或原始照片。
