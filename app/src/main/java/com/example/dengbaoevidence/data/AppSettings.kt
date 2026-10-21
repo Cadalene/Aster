@@ -10,6 +10,7 @@ object AppSettings {
   private const val APPEARANCE = "appearance"
   private const val DEFAULT_WORD_EXPORT_TREE_URI = "default_word_export_tree_uri"
   private const val DEFAULT_PROJECT_PACKAGE_EXPORT_TREE_URI = "default_project_package_export_tree_uri"
+  private const val EXPORT_ROOT_TREE_URI = "export_root_tree_uri"
   private const val EXPANDED_DEVICE_TYPES_PREFIX = "expanded_device_types_"
   private const val PROJECT_LIST_SCROLL_PREFIX = "project_list_scroll_"
 
@@ -75,6 +76,15 @@ object AppSettings {
         remove(projectListScrollIndexKey(projectId))
         remove(projectListScrollOffsetKey(projectId))
       }
+  }
+
+  fun exportRootTreeUri(context: Context): Uri? =
+    context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
+      .getString(EXPORT_ROOT_TREE_URI, null)?.let(Uri::parse)
+
+  fun setExportRootTreeUri(context: Context, uri: Uri) {
+    context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
+      .edit { putString(EXPORT_ROOT_TREE_URI, uri.toString()) }
   }
 
   fun projectListScrollPosition(context: Context, projectId: Long): ProjectListScrollPosition {

@@ -26,11 +26,15 @@ data class TransferredTemplateItem(
   val isKeyScreenshot: Boolean,
   val wordOrder: Int?,
   val excludedFromProgress: Boolean,
+  val verificationMethod: String = "",
 )
 
 data class TemplateImportPreview(
   val templateCount: Int,
   val duplicateNames: List<String>,
+  val identicalNames: List<String>,
+  val differentNames: List<String>,
+  val differenceDetails: Map<String, List<String>>,
 )
 
 data class TemplateImportResult(
@@ -65,7 +69,8 @@ object TemplateTransfer {
                           .put("displayOrder", item.displayOrder)
                           .put("isKeyScreenshot", item.isKeyScreenshot)
                           .put("wordOrder", item.wordOrder ?: JSONObject.NULL)
-                          .put("excludedFromProgress", item.excludedFromProgress),
+                          .put("excludedFromProgress", item.excludedFromProgress)
+                          .put("verificationMethod", item.verificationMethod),
                       )
                     }
                   },
@@ -103,6 +108,7 @@ object TemplateTransfer {
                 isKeyScreenshot = itemJson.optBoolean("isKeyScreenshot", false),
                 wordOrder = wordOrder,
                 excludedFromProgress = itemJson.optBoolean("excludedFromProgress", itemName == TRANSFER_OTHER_ITEM_NAME),
+                verificationMethod = if (itemJson.isNull("verificationMethod")) "" else itemJson.getString("verificationMethod"),
               ),
             )
           }
@@ -116,6 +122,7 @@ object TemplateTransfer {
             isKeyScreenshot = false,
             wordOrder = null,
             excludedFromProgress = true,
+            verificationMethod = parsedItems.firstOrNull { it.name == TRANSFER_OTHER_ITEM_NAME }?.verificationMethod.orEmpty(),
           )
         add(TransferredTemplate(name = name, items = orderedItems))
       }

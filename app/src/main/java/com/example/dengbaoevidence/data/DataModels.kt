@@ -48,6 +48,7 @@ data class TemplateItemEntity(
   val isKeyScreenshot: Boolean,
   val wordOrder: Int?,
   val excludedFromProgress: Boolean = false,
+  @ColumnInfo(defaultValue = "''") val verificationMethod: String = "",
 )
 
 @Entity(
@@ -68,6 +69,7 @@ data class DeviceEntity(
   val name: String,
   val typeName: String,
   val createdAt: Long,
+  @ColumnInfo(defaultValue = "1") val requiresEvidence: Boolean = true,
 )
 
 @Entity(
@@ -95,6 +97,7 @@ data class EvidenceItemEntity(
   @ColumnInfo(defaultValue = "0") val isNotApplicable: Boolean = false,
   val note: String = "",
   val updatedAt: Long,
+  @ColumnInfo(defaultValue = "''") val verificationMethod: String = "",
 )
 
 enum class EvidenceConclusion {
@@ -169,5 +172,7 @@ data class DeviceWithItems(
   val recordedCount: Int get() = progressItems.count { it.isRecorded }
   val totalCount: Int get() = progressItems.size
   val missingKeyScreenshotCount: Int
-    get() = items.count { it.item.isKeyScreenshot && it.photos.isEmpty() }
+    get() = if (!device.requiresEvidence) 0 else {
+      items.count { it.item.isKeyScreenshot && !it.item.isNotApplicable && it.photos.isEmpty() }
+    }
 }

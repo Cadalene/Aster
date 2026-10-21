@@ -16,7 +16,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
     EvidenceItemEntity::class,
     PhotoEntity::class,
   ],
-  version = 4,
+  version = 6,
   exportSchema = false,
 )
 abstract class EvidenceDatabase : RoomDatabase() {
@@ -31,7 +31,7 @@ abstract class EvidenceDatabase : RoomDatabase() {
           context.applicationContext,
           EvidenceDatabase::class.java,
           "evidence.db",
-        ).addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4).build().also { instance = it }
+        ).addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6).build().also { instance = it }
       }
 
     private val MIGRATION_1_2 = object : Migration(1, 2) {
@@ -50,6 +50,19 @@ abstract class EvidenceDatabase : RoomDatabase() {
       override fun migrate(db: SupportSQLiteDatabase) {
         db.execSQL("ALTER TABLE device_type_templates ADD COLUMN isSystemTemplate INTEGER NOT NULL DEFAULT 0")
         db.execSQL("ALTER TABLE device_type_templates ADD COLUMN systemKey TEXT")
+      }
+    }
+
+    private val MIGRATION_4_5 = object : Migration(4, 5) {
+      override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE devices ADD COLUMN requiresEvidence INTEGER NOT NULL DEFAULT 1")
+      }
+    }
+
+    internal val MIGRATION_5_6 = object : Migration(5, 6) {
+      override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE template_items ADD COLUMN verificationMethod TEXT NOT NULL DEFAULT ''")
+        db.execSQL("ALTER TABLE evidence_items ADD COLUMN verificationMethod TEXT NOT NULL DEFAULT ''")
       }
     }
   }

@@ -22,6 +22,8 @@ class DataRepository(
 ) {
   fun observeProjects(): Flow<List<ProjectSummary>> = dao.observeProjects()
 
+  suspend fun getProjectSummariesSnapshot(): List<ProjectSummary> = database.withTransaction { dao.getProjectSummaries() }
+
   fun observeProject(projectId: Long): Flow<ProjectEntity?> = dao.observeProject(projectId)
 
   fun observeDeviceTypes(): Flow<List<DeviceTypeWithItems>> = dao.observeDeviceTypes()
@@ -68,6 +70,7 @@ class DataRepository(
           isKeyScreenshot = source.isKeyScreenshot,
           wordOrder = source.wordOrder,
           excludedFromProgress = source.excludedFromProgress,
+          verificationMethod = source.verificationMethod,
         )
       } ?: listOf(
         TemplateItemEntity(
@@ -140,16 +143,20 @@ class DataRepository(
     displayOrder: Int,
     isKeyScreenshot: Boolean,
     wordOrder: Int?,
+    verificationMethod: String = "",
   ) = database.withTransaction {
     val trimmedName = name.trim()
     require(trimmedName.isNotEmpty()) { "取证项名称不能为空" }
     require(displayOrder >= 0) { "App 显示顺序必须是非负整数" }
     require(wordOrder == null || wordOrder >= 0) { "Word 顺序必须是非负整数" }
     val current = requireNotNull(dao.getTemplateItem(itemId)) { "取证项不存在" }
-    check(current.name != OTHER_ITEM_NAME) { "“其他”是模板保留项" }
+    if (current.name == OTHER_ITEM_NAME) {
+      check(trimmedName == current.name && displayOrder == current.displayOrder &&
+        isKeyScreenshot == current.isKeyScreenshot && wordOrder == current.wordOrder) { "“其他”的名称、顺序和关键截图属性不可修改" }
+    }
     val template = requireNotNull(dao.getDeviceType(current.templateId)) { "设备类型不存在" }
     check(template.items.none { it.id != itemId && it.name == trimmedName }) { "取证项名称已存在" }
-    check(dao.updateTemplateItem(itemId, trimmedName, displayOrder, isKeyScreenshot, wordOrder) == 1) { "取证项不存在" }
+    check(dao.updateTemplateItem(itemId, trimmedName, displayOrder, isKeyScreenshot, wordOrder, verificationMethod) == 1) { "取证项不存在" }
   }
 
   suspend fun reorderTemplateItems(templateId: Long, orderedItemIds: List<Long>) = database.withTransaction {
@@ -169,11 +176,47 @@ class DataRepository(
   }
 
   suspend fun previewTemplateImport(packageData: TemplateTransferPackage): TemplateImportPreview = database.withTransaction {
-    val existingNames = dao.getDeviceTypes().map { it.template.name }.toSet()
+    val existingTemplates = dao.getDeviceTypes().associateBy { it.template.name }
+    val duplicateNames = packageData.templates.map { it.name }.filter { it in existingTemplates }
+    val identicalNames = duplicateNames.filter { name ->
+      templateDifference(existingTemplates.getValue(name), packageData.templates.first { it.name == name }).isEmpty()
+    }
+    val differentNames = duplicateNames - identicalNames.toSet()
     TemplateImportPreview(
       templateCount = packageData.templates.size,
-      duplicateNames = packageData.templates.map { it.name }.filter { it in existingNames },
+      duplicateNames = duplicateNames,
+      identicalNames = identicalNames,
+      differentNames = differentNames,
+      differenceDetails = differentNames.associateWith { name ->
+        templateDifference(existingTemplates.getValue(name), packageData.templates.first { it.name == name })
+      },
     )
+  }
+
+  suspend fun getBackupSnapshot(): Pair<List<ProjectExportData>, List<DeviceTypeWithItems>> = database.withTransaction {
+    val projects = dao.getProjectSummaries().map { summary ->
+      ProjectExportData(summary.project, dao.getDevices(summary.project.id))
+    }
+    projects to dao.getDeviceTypes()
+  }
+
+  private fun templateDifference(existing: DeviceTypeWithItems, imported: TransferredTemplate): List<String> {
+    val currentItems = existing.items.sortedBy { it.displayOrder }
+    val importedItems = imported.items.sortedBy { it.displayOrder }
+    return buildList {
+      if (currentItems.size != importedItems.size) {
+        add("取证项数量 ${currentItems.size} → ${importedItems.size}")
+      }
+      val count = minOf(currentItems.size, importedItems.size)
+      repeat(count) { index ->
+        val current = currentItems[index]
+        val incoming = importedItems[index]
+        if (current.name != incoming.name) add("第 ${index + 1} 项名称：${current.name} → ${incoming.name}")
+        if (current.isKeyScreenshot != incoming.isKeyScreenshot) add("${incoming.name}：关键截图属性变化")
+        if (current.wordOrder != incoming.wordOrder) add("${incoming.name}：Word 顺序变化")
+        if (current.verificationMethod != incoming.verificationMethod) add("${incoming.name}：核查方式变化")
+      }
+    }
   }
 
   suspend fun importDeviceTypes(
@@ -192,6 +235,7 @@ class DataRepository(
     packageData.templates.forEach { imported ->
       val existing = existingTemplates[imported.name]
       when {
+        existing != null && templateDifference(existing, imported).isEmpty() -> skippedCount++
         existing?.template?.isSystemTemplate == true && conflictStrategy == TemplateConflictStrategy.OVERWRITE -> {
           dao.deleteTemplateItems(existing.template.id)
           insertImportedItems(existing.template.id, imported.items)
@@ -246,6 +290,7 @@ class DataRepository(
           isKeyScreenshot = item.isKeyScreenshot,
           wordOrder = item.wordOrder,
           excludedFromProgress = item.excludedFromProgress,
+          verificationMethod = item.verificationMethod,
         )
       },
     )
@@ -268,6 +313,7 @@ class DataRepository(
   suspend fun createProject(name: String): Long = database.withTransaction {
     val trimmedName = name.trim()
     require(trimmedName.isNotEmpty()) { "项目名称不能为空" }
+    check(!dao.projectNameExists(trimmedName)) { "项目名称已存在，请使用其他名称" }
     val overviewTemplate = ensureProjectOverviewTemplate()
     val now = System.currentTimeMillis()
     val projectId = dao.insertProject(ProjectEntity(name = trimmedName, createdAt = now))
@@ -289,6 +335,7 @@ class DataRepository(
           wordOrder = source.wordOrder,
           excludedFromProgress = source.excludedFromProgress,
           isTemporary = false,
+          verificationMethod = source.verificationMethod,
           updatedAt = now,
         )
       },
@@ -300,6 +347,7 @@ class DataRepository(
     val trimmedName = name.trim()
     require(trimmedName.isNotEmpty()) { "项目名称不能为空" }
     requireNotNull(dao.getProject(projectId)) { "项目不存在" }
+    check(!dao.projectNameExists(trimmedName, projectId)) { "项目名称已存在，请使用其他名称" }
     check(dao.updateProjectName(projectId, trimmedName) == 1) { "项目不存在" }
   }
 
@@ -339,6 +387,7 @@ class DataRepository(
             wordOrder = source.wordOrder,
             excludedFromProgress = source.excludedFromProgress,
             isTemporary = false,
+            verificationMethod = source.verificationMethod,
             updatedAt = now,
           )
         },
@@ -351,6 +400,11 @@ class DataRepository(
     require(trimmedName.isNotEmpty()) { "设备名称不能为空" }
     requireNotNull(dao.getDevice(deviceId)) { "设备不存在" }
     check(dao.updateDeviceName(deviceId, trimmedName) == 1) { "设备不存在" }
+  }
+
+  suspend fun setDeviceRequiresEvidence(deviceId: Long, requiresEvidence: Boolean) = database.withTransaction {
+    requireNotNull(dao.getDevice(deviceId)) { "设备不存在" }
+    check(dao.updateDeviceRequiresEvidence(deviceId, requiresEvidence) == 1) { "设备设置保存失败" }
   }
 
   suspend fun deleteDevice(deviceId: Long): PhotoCleanupResult {

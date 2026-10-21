@@ -30,24 +30,42 @@ data class ProjectPackageExportSummary(
 )
 
 object ProjectPackageExporter {
-  fun export(context: Context, data: ProjectExportData, destination: File): ProjectPackageExportSummary {
+  fun export(
+    context: Context,
+    data: ProjectExportData,
+    destination: File,
+    onProgress: (Int, String) -> Unit = { _, _ -> },
+    beforeWrite: (Int) -> Unit = {},
+  ): ProjectPackageExportSummary {
     destination.parentFile?.mkdirs()
     val exportedAt = System.currentTimeMillis()
+    onProgress(5, "正在准备项目浏览包")
     val plan = buildPlan(data)
     try {
-      ZipOutputStream(destination.outputStream().buffered()).use { zip ->
+      ZipOutputStream(ExportFileIo.checkedOutput(destination.outputStream().buffered(), beforeWrite)).use { zip ->
         zip.setLevel(Deflater.BEST_SPEED)
         writeAsset(context, zip, VIEWER_ASSET_NAME, INDEX_ENTRY_NAME)
 
         zip.setLevel(Deflater.NO_COMPRESSION)
-        plan.photos.forEach { photo -> writeOriginal(zip, photo) }
+        plan.photos.forEachIndexed { index, photo ->
+          writeOriginal(zip, photo)
+          onProgress(10 + ((index + 1) * 45 / plan.photos.size.coerceAtLeast(1)), "正在处理原图：${index + 1} / ${plan.photos.size}")
+        }
 
         zip.setLevel(Deflater.BEST_SPEED)
-        plan.photos.forEach { photo -> writeThumbnail(zip, photo) }
+        plan.photos.forEachIndexed { index, photo ->
+          writeThumbnail(zip, photo)
+          if (photo.browserPath != photo.originalPath) {
+            onProgress(55 + (index * 35 / plan.photos.size.coerceAtLeast(1)), "正在转换 HEIC 浏览副本：${index + 1} / ${plan.photos.size}")
+            writeBrowserPreview(zip, photo)
+          }
+          onProgress(55 + ((index + 1) * 35 / plan.photos.size.coerceAtLeast(1)), "正在生成缩略图和浏览副本：${index + 1} / ${plan.photos.size}")
+        }
         writeText(zip, DATA_ENTRY_NAME, "window.EVIDENCE_EXPORT = ${buildDataJson(data, plan, exportedAt)};\n")
         writeText(zip, MANIFEST_ENTRY_NAME, buildManifestJson(data, plan, exportedAt).toString(2))
       }
-      validatePackage(destination, plan.photos.size)
+      validatePackage(destination, plan.photos.size, plan.photos.count { it.browserPath != it.originalPath })
+      onProgress(100, "项目浏览包已生成，准备保存")
       return ProjectPackageExportSummary(
         deviceCount = plan.devices.size,
         itemCount = plan.devices.sumOf { it.items.size },
@@ -99,6 +117,7 @@ object ProjectPackageExporter {
               expectedSha256 = sourcePhoto.sha256,
               originalPath = "originals/$typePath/$devicePath/$fileName",
               thumbnailPath = "thumbnails/photo_${sourcePhoto.id}_$photoIndex.jpg",
+              browserPath = if (BrowserImageCompatibility.needsJpegPreview(source)) "previews/photo_${sourcePhoto.id}_$photoIndex.jpg" else "originals/$typePath/$devicePath/$fileName",
               mimeType = MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension) ?: "application/octet-stream",
             )
           }
@@ -162,12 +181,30 @@ object ProjectPackageExporter {
     }
   }
 
-  private fun decodeThumbnail(file: File): Bitmap =
+  private fun writeBrowserPreview(zip: ZipOutputStream, photo: ExportPhoto) {
+    val bitmap = try { decodeThumbnail(photo.source, 3200, browserPreview = true) } catch (error: Exception) {
+      throw IllegalStateException("HEIC 浏览副本转换失败：${photo.source.name}；原图未修改，请检查手机是否支持解码该照片", error)
+    }
+    val output = if (bitmap.hasAlpha()) {
+      createBitmap(bitmap.width, bitmap.height, Bitmap.Config.ARGB_8888).also { target ->
+        Canvas(target).apply { drawColor(Color.WHITE); drawBitmap(bitmap, 0f, 0f, null) }
+      }
+    } else bitmap
+    try {
+      zip.putNextEntry(ZipEntry(photo.browserPath).also { it.time = photo.createdAt })
+      try { check(output.compress(Bitmap.CompressFormat.JPEG, 94, zip)) { "HEIC 浏览副本保存失败" } }
+      finally { zip.closeEntry() }
+    } finally { if (output !== bitmap) output.recycle(); bitmap.recycle() }
+  }
+
+  private fun decodeThumbnail(file: File, maxEdge: Int = THUMBNAIL_MAX_EDGE_PX, browserPreview: Boolean = false): Bitmap =
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
       ImageDecoder.decodeBitmap(ImageDecoder.createSource(file)) { decoder, info, _ ->
-        val target = fitWithin(info.size.width, info.size.height, THUMBNAIL_MAX_EDGE_PX)
+        val target = fitWithin(info.size.width, info.size.height, maxEdge)
         decoder.setAllocator(ImageDecoder.ALLOCATOR_SOFTWARE)
-        decoder.setMemorySizePolicy(ImageDecoder.MEMORY_POLICY_LOW_RAM)
+        if (browserPreview) {
+          decoder.setTargetColorSpace(android.graphics.ColorSpace.get(android.graphics.ColorSpace.Named.SRGB))
+        } else decoder.setMemorySizePolicy(ImageDecoder.MEMORY_POLICY_LOW_RAM)
         decoder.setTargetSize(target.first, target.second)
       }
     } else {
@@ -175,7 +212,7 @@ object ProjectPackageExporter {
       BitmapFactory.decodeFile(file.absolutePath, bounds)
       require(bounds.outWidth > 0 && bounds.outHeight > 0) { "无法读取图片" }
       var sampleSize = 1
-      while (maxOf(bounds.outWidth, bounds.outHeight) / sampleSize > THUMBNAIL_MAX_EDGE_PX) sampleSize *= 2
+      while (maxOf(bounds.outWidth, bounds.outHeight) / sampleSize > maxEdge) sampleSize *= 2
       val decoded = requireNotNull(
         BitmapFactory.decodeFile(file.absolutePath, BitmapFactory.Options().also { it.inSampleSize = sampleSize }),
       ) { "无法读取图片" }
@@ -244,6 +281,7 @@ object ProjectPackageExporter {
     .put("name", device.source.device.name)
     .put("typeName", device.source.device.typeName)
     .put("createdAt", device.source.device.createdAt)
+    .put("requiresEvidence", device.source.device.requiresEvidence)
     .put("recordedCount", device.source.recordedCount)
     .put("totalCount", device.source.totalCount)
     .put("missingKeyScreenshotCount", device.source.missingKeyScreenshotCount)
@@ -262,6 +300,7 @@ object ProjectPackageExporter {
     .put("isCompliant", item.source.item.isCompliant)
     .put("isNotApplicable", item.source.item.isNotApplicable)
     .put("note", item.source.item.note)
+    .put("verificationMethod", item.source.item.verificationMethod)
     .put("updatedAt", item.source.item.updatedAt)
     .put("isRecorded", item.source.isRecorded)
     .put("photos", JSONArray().also { array ->
@@ -276,6 +315,7 @@ object ProjectPackageExporter {
     .put("fileSize", photo.source.length())
     .put("mimeType", photo.mimeType)
     .put("originalPath", photo.originalPath)
+    .put("browserPath", photo.browserPath)
     .put("thumbnailPath", photo.thumbnailPath)
     .put("thumbnailAvailable", photo.thumbnailAvailable)
 
@@ -297,6 +337,7 @@ object ProjectPackageExporter {
           array.put(JSONObject()
             .put("id", photo.id)
             .put("originalPath", photo.originalPath)
+            .put("browserPath", photo.browserPath)
             .put("thumbnailPath", photo.thumbnailPath)
             .put("fileSize", photo.source.length())
             .put("sha256", photo.verifiedSha256))
@@ -321,7 +362,7 @@ object ProjectPackageExporter {
     }
   }
 
-  private fun validatePackage(file: File, expectedPhotoCount: Int) {
+  private fun validatePackage(file: File, expectedPhotoCount: Int, expectedPreviewCount: Int) {
     check(file.isFile && file.length() > 0L) { "项目导出包生成失败" }
     ZipFile(file).use { zip ->
       REQUIRED_ENTRIES.forEach { entryName ->
@@ -331,6 +372,7 @@ object ProjectPackageExporter {
       val thumbnailCount = zip.entries().asSequence().count { !it.isDirectory && it.name.startsWith("thumbnails/") }
       check(originalCount == expectedPhotoCount) { "项目导出包原始照片数量不完整" }
       check(thumbnailCount == expectedPhotoCount) { "项目导出包缩略图数量不完整" }
+      check(zip.entries().asSequence().count { !it.isDirectory && it.name.startsWith("previews/") && it.size > 0 } == expectedPreviewCount) { "项目导出包 HEIC 浏览副本数量不完整" }
       val manifest = zip.getInputStream(zip.getEntry(MANIFEST_ENTRY_NAME)).bufferedReader(Charsets.UTF_8).use { it.readText() }
       check(JSONObject(manifest).getJSONObject("summary").getInt("photoCount") == expectedPhotoCount) {
         "项目导出包清单不完整"
@@ -393,6 +435,7 @@ object ProjectPackageExporter {
     val originalPath: String,
     val thumbnailPath: String,
     val mimeType: String,
+    val browserPath: String,
     var verifiedSha256: String = "",
     var thumbnailAvailable: Boolean = true,
   )
@@ -401,7 +444,7 @@ object ProjectPackageExporter {
   private const val INDEX_ENTRY_NAME = "index.html"
   private const val DATA_ENTRY_NAME = "data.js"
   private const val MANIFEST_ENTRY_NAME = "manifest.json"
-  private const val EXPORT_FORMAT_VERSION = "1.1"
+  private const val EXPORT_FORMAT_VERSION = "1.2"
   private const val THUMBNAIL_MAX_EDGE_PX = 720
   private const val THUMBNAIL_JPEG_QUALITY = 82
   private const val MAX_PATH_SEGMENT_LENGTH = 80

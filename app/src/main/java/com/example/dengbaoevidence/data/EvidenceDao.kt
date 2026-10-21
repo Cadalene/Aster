@@ -20,11 +20,17 @@ interface EvidenceDao {
   )
   fun observeProjects(): Flow<List<ProjectSummary>>
 
+  @Query("SELECT p.*, COUNT(d.id) AS deviceCount FROM projects p LEFT JOIN devices d ON d.projectId = p.id GROUP BY p.id ORDER BY p.createdAt DESC")
+  suspend fun getProjectSummaries(): List<ProjectSummary>
+
   @Query("SELECT * FROM projects WHERE id = :projectId")
   fun observeProject(projectId: Long): Flow<ProjectEntity?>
 
   @Query("SELECT * FROM projects WHERE id = :projectId")
   suspend fun getProject(projectId: Long): ProjectEntity?
+
+  @Query("SELECT EXISTS(SELECT 1 FROM projects WHERE name = :name AND id != :excludingId)")
+  suspend fun projectNameExists(name: String, excludingId: Long = 0): Boolean
 
   @Query("UPDATE projects SET name = :name WHERE id = :projectId")
   suspend fun updateProjectName(projectId: Long, name: String): Int
@@ -102,7 +108,8 @@ interface EvidenceDao {
       SET name = :name,
           displayOrder = :displayOrder,
           isKeyScreenshot = :isKeyScreenshot,
-          wordOrder = :wordOrder
+          wordOrder = :wordOrder,
+          verificationMethod = :verificationMethod
       WHERE id = :itemId
     """
   )
@@ -112,6 +119,7 @@ interface EvidenceDao {
     displayOrder: Int,
     isKeyScreenshot: Boolean,
     wordOrder: Int?,
+    verificationMethod: String = "",
   ): Int
 
   @Query("UPDATE template_items SET displayOrder = :displayOrder WHERE id = :itemId")
@@ -160,6 +168,9 @@ interface EvidenceDao {
 
   @Query("UPDATE devices SET name = :name WHERE id = :deviceId")
   suspend fun updateDeviceName(deviceId: Long, name: String): Int
+
+  @Query("UPDATE devices SET requiresEvidence = :requiresEvidence WHERE id = :deviceId")
+  suspend fun updateDeviceRequiresEvidence(deviceId: Long, requiresEvidence: Boolean): Int
 
   @Query("DELETE FROM devices WHERE id = :deviceId")
   suspend fun deleteDevice(deviceId: Long): Int

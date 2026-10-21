@@ -30,11 +30,44 @@ data class WordExportSummary(
 )
 
 object WordExporter {
-  fun export(context: Context, data: ProjectExportData, destination: File): WordExportSummary {
-    destination.parentFile?.mkdirs()
-    val plan = buildPlan(context, data)
+  fun export(
+    context: Context,
+    data: ProjectExportData,
+    destination: File,
+    onProgress: (Int, String) -> Unit = { _, _ -> },
+    beforeWrite: (Int) -> Unit = {},
+  ): WordExportSummary {
+    val template = WordTemplateStore.snapshot(context)
+    if (template == null) return exportGenerated(context, data, destination, onProgress, beforeWrite)
+    val generated = File(context.cacheDir, "word_body_${UUID.randomUUID()}.docx")
     try {
-      ZipOutputStream(destination.outputStream().buffered()).use { zip ->
+      val summary = exportGenerated(context, data, generated, { value, message -> onProgress(value * 8 / 10, message) }, beforeWrite)
+      onProgress(82, "正在保留模板并追加取证内容")
+      DocxTemplateMerger.append(template, generated, destination, beforeWrite)
+      onProgress(100, "Word 文档已生成，准备保存")
+      return summary
+    } catch (error: Throwable) {
+      destination.delete()
+      throw error
+    } finally {
+      generated.delete()
+      template.delete()
+    }
+  }
+
+  private fun exportGenerated(
+    context: Context,
+    data: ProjectExportData,
+    destination: File,
+    onProgress: (Int, String) -> Unit,
+    beforeWrite: (Int) -> Unit,
+  ): WordExportSummary {
+    destination.parentFile?.mkdirs()
+    onProgress(5, "正在准备 Word 文档")
+    val temporaryFiles = mutableListOf<File>()
+    try {
+      val plan = buildPlan(context, data, temporaryFiles, onProgress, beforeWrite)
+      ZipOutputStream(ExportFileIo.checkedOutput(destination.outputStream().buffered(), beforeWrite)).use { zip ->
         zip.setLevel(Deflater.DEFAULT_COMPRESSION)
         writeContentTypes(zip, plan.photos)
         writePackageRelationships(zip)
@@ -43,13 +76,15 @@ object WordExporter {
         writeStyles(zip)
         writeDocumentRelationships(zip, plan.photos)
         writeDocument(zip, data.project.name, plan.devices)
-        plan.photos.forEach { photo ->
+        plan.photos.forEachIndexed { index, photo ->
+          onProgress(20 + ((index + 1) * 70 / plan.photos.size.coerceAtLeast(1)), "正在插入图片：${index + 1} / ${plan.photos.size}")
           zip.putNextEntry(ZipEntry("word/media/${photo.mediaName}"))
           photo.file.inputStream().buffered().use { it.copyTo(zip) }
           zip.closeEntry()
         }
       }
       validateDocument(destination, plan.photos.size)
+      onProgress(100, "Word 文档已生成，准备保存")
       return WordExportSummary(
         deviceCount = plan.devices.size,
         itemCount = plan.devices.sumOf { it.items.size },
@@ -59,12 +94,18 @@ object WordExporter {
       destination.delete()
       throw throwable
     } finally {
-      plan.temporaryFiles.forEach(File::delete)
+      temporaryFiles.forEach(File::delete)
     }
   }
 
-  private fun buildPlan(context: Context, data: ProjectExportData): ExportPlan {
-    val temporaryFiles = mutableListOf<File>()
+  private fun buildPlan(
+    context: Context,
+    data: ProjectExportData,
+    temporaryFiles: MutableList<File>,
+    onProgress: (Int, String) -> Unit,
+    beforeWrite: (Int) -> Unit,
+  ): ExportPlan {
+    val photoCount = data.devices.sumOf { device -> device.items.filter { it.item.isKeyScreenshot }.sumOf { it.photos.size } }
     var imageIndex = 0
     val devices = data.devices.mapNotNull { device ->
       val items = device.items
@@ -73,10 +114,13 @@ object WordExporter {
         .sortedWith(compareBy<EvidenceItemWithPhotos> { it.item.wordOrder ?: Int.MAX_VALUE }.thenBy { it.item.displayOrder })
         .mapNotNull { item ->
           val photos = item.photos.sortedBy { it.sortOrder }.mapNotNull { photo ->
-            val source = File(photo.path).takeIf { it.isFile && it.length() > 0L } ?: return@mapNotNull null
+            val source = File(photo.path)
+            check(source.isFile && source.length() > 0L) { "关键截图文件不存在：${device.device.name} / ${item.item.name}" }
             imageIndex += 1
-            prepareImage(context, source, imageIndex).also {
+            beforeWrite(0)
+            prepareImage(context, source, imageIndex, beforeWrite).also {
               if (it.temporary) temporaryFiles += it.file
+              onProgress(5 + imageIndex * 15 / photoCount.coerceAtLeast(1), "正在准备图片：$imageIndex / $photoCount")
             }
           }
           photos.takeIf { it.isNotEmpty() }?.let { ExportItem(item.item.name, it) }
@@ -84,10 +128,10 @@ object WordExporter {
         .toList()
       items.takeIf { it.isNotEmpty() }?.let { ExportDevice(device.device.name, it) }
     }
-    return ExportPlan(devices, devices.flatMap { it.items }.flatMap { it.photos }, temporaryFiles)
+    return ExportPlan(devices, devices.flatMap { it.items }.flatMap { it.photos })
   }
 
-  private fun prepareImage(context: Context, source: File, index: Int): ExportPhoto {
+  private fun prepareImage(context: Context, source: File, index: Int, beforeWrite: (Int) -> Unit): ExportPhoto {
     val bounds = BitmapFactory.Options().also { it.inJustDecodeBounds = true }
     BitmapFactory.decodeFile(source.absolutePath, bounds)
     val mimeType = bounds.outMimeType
@@ -125,7 +169,7 @@ object WordExporter {
         bitmap
       }
       try {
-        output.outputStream().buffered().use { stream ->
+        ExportFileIo.checkedOutput(output.outputStream().buffered(), beforeWrite).use { stream ->
           check(opaqueBitmap.compress(Bitmap.CompressFormat.JPEG, 94, stream)) { "图片转换失败" }
         }
         check(output.isFile && output.length() > 0L) { "图片转换失败" }
@@ -561,7 +605,6 @@ object WordExporter {
   private data class ExportPlan(
     val devices: List<ExportDevice>,
     val photos: List<ExportPhoto>,
-    val temporaryFiles: List<File>,
   )
 
   private data class ExportDevice(val name: String, val items: List<ExportItem>)
