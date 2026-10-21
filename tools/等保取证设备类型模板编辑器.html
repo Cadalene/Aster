@@ -359,11 +359,13 @@
                   // App JSON stores Word order as zero-based; the editor shows one-based numbers.
                   wordOrder: rawWord !== null && rawWord >= 0 ? rawWord + 1 : null,
                   excludedFromProgress: false,
+                  verificationMethod: String(item.verificationMethod ?? ''),
                 };
               })
               .filter(Boolean);
             items.forEach((item, itemIndex) => { item.displayOrder = itemIndex; });
             const other = makeOther();
+            other.verificationMethod = String(sourceItems.find(item => clean(item.name) === OTHER)?.verificationMethod ?? '');
             other.displayOrder = items.length;
             items.push(other);
             return { id: uid('template'), name, sortOrder: templateIndex, items };
@@ -384,6 +386,7 @@
               isKeyScreenshot: item.name === OTHER ? false : Boolean(item.isKeyScreenshot),
               wordOrder: item.name === OTHER || item.wordOrder === null ? null : Math.max(0, integer(item.wordOrder, 1) - 1),
               excludedFromProgress: item.name === OTHER,
+              verificationMethod: String(item.verificationMethod ?? ''),
             })),
           })),
         };
@@ -530,6 +533,7 @@
                 <button class="mini-button" type="button" data-action="move-item-down" data-id="${escapeAttribute(item.id)}" ${reserved || index === template.items.length - 2 ? 'disabled' : ''} title="下移">↓</button>
                 <button class="mini-button danger" type="button" data-action="delete-item" data-id="${escapeAttribute(item.id)}" ${reserved ? 'disabled' : ''} title="删除">×</button>
               </div>
+              <div style="grid-column: 2 / -1"><label class="field-label">核查方式（选填）</label><textarea class="item-name-input" rows="3" data-field="verification-method" data-item-id="${escapeAttribute(item.id)}">${escapeHtml(item.verificationMethod ?? '')}</textarea></div>
             </article>`;
         }).join('') + `<div class="add-item-row"><button type="button" data-action="add-item">＋ 添加一个取证项</button></div>`;
       }
@@ -614,8 +618,8 @@
           name: uniqueName(copyFrom ? `${base.name}（副本）` : base.name, used, '新设备类型'),
           sortOrder: state.templates.length,
           items: (base.items || []).filter(item => item.name !== OTHER).map((item, index) => ({
-            id: uid('item'), name: item.name, displayOrder: index, isKeyScreenshot: Boolean(item.isKeyScreenshot), wordOrder: item.wordOrder === null ? null : Number(item.wordOrder), excludedFromProgress: false,
-          })).concat([makeOther()]),
+            id: uid('item'), name: item.name, displayOrder: index, isKeyScreenshot: Boolean(item.isKeyScreenshot), wordOrder: item.wordOrder === null ? null : Number(item.wordOrder), excludedFromProgress: false, verificationMethod: String(item.verificationMethod ?? ''),
+          })).concat([Object.assign(makeOther(), { verificationMethod: String(base.items?.find(item => item.name === OTHER)?.verificationMethod ?? '') })]),
         };
         normalizeItemOrders(template);
         state.templates.push(template); state.selectedId = template.id; state.dirty = true; render();
@@ -759,6 +763,8 @@
           item.name = event.target.value; markDirty(); renderStatus(); renderTemplateList(); refreshEditorSummary();
         } else if (field === 'word-order') {
           item.wordOrder = event.target.value === '' ? null : integer(event.target.value, null); markDirty(); renderStatus();
+        } else if (field === 'verification-method') {
+          item.verificationMethod = event.target.value; markDirty();
         }
       });
       $('#editorRoot').addEventListener('change', event => {
