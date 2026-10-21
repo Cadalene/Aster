@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -35,6 +36,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.HorizontalDivider
@@ -162,7 +164,7 @@ fun TemplateManagementScreen(
   Scaffold(
     containerColor = TemplatePageBackground,
     topBar = {
-      TopAppBar(
+      CenterAlignedTopAppBar(
         title = { Text("设备类型模板", style = MaterialTheme.typography.titleLarge) },
         actions = {
           IconButton(onClick = onOpenSettings) {
@@ -655,6 +657,9 @@ private fun TemplateItemRow(
       }
       if (isReserved) {
         Icon(Icons.Default.Lock, contentDescription = "保留项", tint = MaterialTheme.colorScheme.outline, modifier = Modifier.padding(horizontal = 14.dp))
+        IconButton(onClick = onEdit) {
+          Icon(Icons.Default.Edit, contentDescription = "编辑核查方式")
+        }
       } else {
         IconButton(onClick = onEdit) {
           Icon(Icons.Default.Edit, contentDescription = "编辑取证项")
@@ -694,7 +699,9 @@ private fun TemplateItemDialog(
 ) {
   var name by rememberSaveable(item.id) { mutableStateOf(item.name) }
   var isKeyScreenshot by rememberSaveable(item.id) { mutableStateOf(item.isKeyScreenshot) }
+  var verificationMethod by rememberSaveable(item.id) { mutableStateOf(item.verificationMethod) }
   var wordOrder by rememberSaveable(item.id) { mutableStateOf(item.wordOrder?.let { (it + 1).toString() } ?: "") }
+  val isReserved = item.name == "其他"
   val wordOrderValue = wordOrder.toIntOrNull()
   val valid = name.isNotBlank() &&
     (wordOrder.isBlank() || (wordOrderValue != null && wordOrderValue > 0))
@@ -703,23 +710,32 @@ private fun TemplateItemDialog(
     onDismissRequest = onDismiss,
     title = { Text("编辑取证项") },
     text = {
-      Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+      Column(modifier = Modifier.heightIn(max = 440.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         OutlinedTextField(
           value = name,
           onValueChange = { name = it },
           label = { Text("取证项名称") },
+          enabled = !isReserved,
           singleLine = true,
           modifier = Modifier.fillMaxWidth(),
         )
         Row(verticalAlignment = Alignment.CenterVertically) {
-          Checkbox(checked = isKeyScreenshot, onCheckedChange = { isKeyScreenshot = it })
+          Checkbox(checked = isKeyScreenshot, onCheckedChange = { isKeyScreenshot = it }, enabled = !isReserved)
           Text("属于关键设备截图项")
         }
         OutlinedTextField(
           value = wordOrder,
           onValueChange = { wordOrder = it.filter(Char::isDigit) },
           label = { Text("Word 排列顺序（从 1 开始，可留空）") },
+          enabled = !isReserved,
           singleLine = true,
+          modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+          value = verificationMethod,
+          onValueChange = { verificationMethod = it },
+          label = { Text("核查方式（选填）") },
+          minLines = 3,
           modifier = Modifier.fillMaxWidth(),
         )
       }
@@ -730,6 +746,7 @@ private fun TemplateItemDialog(
           onConfirm(
             item.copy(
               name = name.trim(),
+              verificationMethod = verificationMethod,
               isKeyScreenshot = isKeyScreenshot,
               wordOrder = if (isKeyScreenshot && wordOrderValue != null) wordOrderValue - 1 else null,
             ),

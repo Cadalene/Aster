@@ -1,6 +1,5 @@
 package com.example.dengbaoevidence.ui.main
 
-import android.content.Context
 import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -29,6 +28,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Notes
@@ -66,6 +66,7 @@ import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -92,9 +93,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.documentfile.provider.DocumentFile
 import coil3.compose.AsyncImage
 import com.example.dengbaoevidence.data.AppSettings
+import com.example.dengbaoevidence.data.persistExportDirectory
 import com.example.dengbaoevidence.data.DeviceTypeWithItems
 import com.example.dengbaoevidence.data.DeviceWithItems
 import com.example.dengbaoevidence.data.EvidenceConclusion
@@ -264,9 +265,14 @@ fun ProjectScreen(
   var showDeleteExportReminder by rememberSaveable { mutableStateOf(false) }
   var showDeleteFinalDialog by rememberSaveable { mutableStateOf(false) }
   var deletingProject by rememberSaveable(projectId) { mutableStateOf(false) }
-  var exportingWord by rememberSaveable(projectId) { mutableStateOf(false) }
-  var exportingPackage by rememberSaveable(projectId) { mutableStateOf(false) }
-  var pendingDefaultExport by remember { mutableStateOf<DefaultExportTarget?>(null) }
+  val exportState by viewModel.exportProgress.collectAsStateWithLifecycle()
+  val exportingWord = exportState?.kind == ExportKind.WORD && exportState?.projectId == projectId
+  val exportingPackage = exportState?.kind == ExportKind.PROJECT_PACKAGE && exportState?.projectId == projectId
+  val exportProgress = exportState?.percent ?: 0
+  val exportProgressMessage = exportState?.message.orEmpty()
+  var pendingDefaultExport by rememberSaveable { mutableStateOf<DefaultExportTarget?>(null) }
+  var pickerExport by rememberSaveable { mutableStateOf<DefaultExportTarget?>(null) }
+  var pickerSetsDefault by rememberSaveable { mutableStateOf(false) }
 
   LaunchedEffect(projectId, devices.size, expandedTypes) {
     if (!restoreScrollPosition.value && devices.isNotEmpty()) {
@@ -295,76 +301,26 @@ fun ProjectScreen(
     )
     onOpenDevice(deviceId)
   }
-  val createWordDocument = rememberLauncherForActivityResult(
-    ActivityResultContracts.CreateDocument(DOCX_MIME_TYPE),
-  ) { destination ->
-    destination?.let {
-      exportingWord = true
-      viewModel.exportKeyScreenshotsWord(projectId, context, it) { exportingWord = false }
+  fun startExport(target: DefaultExportTarget, directory: Uri, useSubdirectory: Boolean) {
+    when (target) {
+      DefaultExportTarget.PROJECT_PACKAGE -> viewModel.exportProjectPackage(projectId, context, directory, useSubdirectory)
+      DefaultExportTarget.WORD -> viewModel.exportKeyScreenshotsWord(projectId, context, directory, useSubdirectory)
     }
   }
-  val createProjectPackage = rememberLauncherForActivityResult(
-    ActivityResultContracts.CreateDocument(ZIP_MIME_TYPE),
-  ) { destination ->
-    destination?.let {
-      exportingPackage = true
-      viewModel.exportProjectPackage(projectId, context, it) { exportingPackage = false }
-    }
-  }
-  fun exportProjectPackageToDefault() {
-    project?.let {
-      val fileName = projectPackageFileName(it.name)
-      val destination = createFileInDefaultTree(
-        context = context,
-        treeUri = AppSettings.defaultProjectPackageExportTreeUri(context),
-        mimeType = ZIP_MIME_TYPE,
-        fileName = fileName,
-      )
-      if (destination == null) {
-        createProjectPackage.launch(fileName)
-      } else {
-        exportingPackage = true
-        viewModel.exportProjectPackage(projectId, context, destination) { exportingPackage = false }
-      }
-    }
-  }
-  fun requestProjectPackageExport() {
-    project?.let {
-      if (AppSettings.defaultProjectPackageExportTreeUri(context) == null) {
-        createProjectPackage.launch(projectPackageFileName(it.name))
-      } else {
-        pendingDefaultExport = DefaultExportTarget.PROJECT_PACKAGE
-      }
-    }
-  }
-  fun exportWordDocumentToDefault() {
-    project?.let {
-      val fileName = wordDocumentFileName(it.name)
-      val destination = createFileInDefaultTree(
-        context = context,
-        treeUri = AppSettings.defaultWordExportTreeUri(context),
-        mimeType = DOCX_MIME_TYPE,
-        fileName = fileName,
-      )
-      if (destination == null) {
-        createWordDocument.launch(fileName)
-      } else {
-        exportingWord = true
-        viewModel.exportKeyScreenshotsWord(projectId, context, destination) { exportingWord = false }
-      }
-    }
-  }
-  fun requestWordDocumentExport() {
-    project?.let {
-      if (AppSettings.defaultWordExportTreeUri(context) == null) {
-        createWordDocument.launch(wordDocumentFileName(it.name))
-      } else {
-        pendingDefaultExport = DefaultExportTarget.WORD
-      }
+  val exportDirectoryPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+    val target = pickerExport
+    pickerExport = null
+    if (uri != null && target != null) {
+      val ready = runCatching {
+        if (pickerSetsDefault) {
+          persistExportDirectory(context, uri)
+        }
+      }.isSuccess
+      if (ready) startExport(target, uri, pickerSetsDefault) else viewModel.reportExportLocationError()
     }
   }
   val grouped = devices.groupBy { it.device.typeName }
-  val exportBusy = exportingWord || exportingPackage
+  val exportBusy = exportState != null
 
   Scaffold(
     containerColor = PageBackground,
@@ -405,9 +361,11 @@ fun ProjectScreen(
           ProjectExportActions(
             packageExporting = exportingPackage,
             wordExporting = exportingWord,
-            enabled = project != null,
-            onExportPackage = ::requestProjectPackageExport,
-            onExportWord = ::requestWordDocumentExport,
+            exportProgress = exportProgress,
+            exportProgressMessage = exportProgressMessage,
+            enabled = project != null && (!exportBusy || exportingPackage || exportingWord),
+            onExportPackage = { pendingDefaultExport = DefaultExportTarget.PROJECT_PACKAGE },
+            onExportWord = { pendingDefaultExport = DefaultExportTarget.WORD },
           )
         }
         if (devices.isEmpty()) {
@@ -520,27 +478,26 @@ fun ProjectScreen(
     AlertDialog(
       onDismissRequest = { pendingDefaultExport = null },
       title = { Text("选择导出位置") },
-      text = { Text("已为${exportName}设置默认目录，是否导出到该目录？") },
+      text = { Text(if (AppSettings.exportRootTreeUri(context) == null) "尚未设置默认导出位置，请先选择一个目录。" else "是否将${exportName}保存到默认导出位置？") },
       confirmButton = {
         TextButton(onClick = {
           pendingDefaultExport = null
-          when (target) {
-            DefaultExportTarget.PROJECT_PACKAGE -> exportProjectPackageToDefault()
-            DefaultExportTarget.WORD -> exportWordDocumentToDefault()
-          }
-        }) { Text("导出到默认目录") }
+          val root = AppSettings.exportRootTreeUri(context)
+          if (root == null) {
+            pickerExport = target
+            pickerSetsDefault = true
+            exportDirectoryPicker.launch(null)
+          } else startExport(target, root, true)
+        }) { Text("保存到默认位置") }
       },
       dismissButton = {
         Row {
           TextButton(onClick = { pendingDefaultExport = null }) { Text("取消") }
           TextButton(onClick = {
             pendingDefaultExport = null
-            project?.let { current ->
-              when (target) {
-                DefaultExportTarget.PROJECT_PACKAGE -> createProjectPackage.launch(projectPackageFileName(current.name))
-                DefaultExportTarget.WORD -> createWordDocument.launch(wordDocumentFileName(current.name))
-              }
-            }
+            pickerExport = target
+            pickerSetsDefault = false
+            exportDirectoryPicker.launch(null)
           }) { Text("选择其他位置") }
         }
       },
@@ -554,6 +511,8 @@ fun ProjectScreen(
 private fun ProjectExportActions(
   packageExporting: Boolean,
   wordExporting: Boolean,
+  exportProgress: Int,
+  exportProgressMessage: String,
   enabled: Boolean,
   onExportPackage: () -> Unit,
   onExportWord: () -> Unit,
@@ -564,6 +523,10 @@ private fun ProjectExportActions(
     verticalArrangement = Arrangement.spacedBy(9.dp),
   ) {
     Text("导出项目文件", fontWeight = FontWeight.SemiBold)
+    if (busy) {
+      LinearProgressIndicator(progress = { exportProgress / 100f }, modifier = Modifier.fillMaxWidth())
+      Text("$exportProgress% · $exportProgressMessage", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
     Button(
       onClick = onExportPackage,
       enabled = enabled && !busy,
@@ -607,6 +570,7 @@ private fun DeviceGroupHeader(
   onToggle: () -> Unit,
 ) {
   val incomplete = devices.count { it.missingKeyScreenshotCount > 0 }
+  val unableToEvidence = devices.count { !it.device.requiresEvidence }
   Surface(
     color = MaterialTheme.colorScheme.surface,
     modifier = Modifier.fillMaxWidth().clickable(onClick = onToggle),
@@ -621,8 +585,12 @@ private fun DeviceGroupHeader(
       )
       Spacer(Modifier.width(8.dp))
       Column(modifier = Modifier.weight(1f)) {
-        Text(typeName, fontWeight = FontWeight.SemiBold)
+        Text(typeName, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
         Text("${devices.size} 台设备", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+      }
+      if (unableToEvidence > 0) {
+        StatusBadge(text = "${unableToEvidence}台设备无法取证", foreground = Warning, background = WarningSoft)
+        Spacer(Modifier.width(6.dp))
       }
       if (incomplete > 0) {
         StatusBadge(text = "$incomplete 台缺关键截图", foreground = Danger, background = DangerSoft)
@@ -643,7 +611,18 @@ private fun DeviceRow(device: DeviceWithItems, onClick: () -> Unit) {
   ) {
     Column(modifier = Modifier.weight(1f)) {
       Row(verticalAlignment = Alignment.CenterVertically) {
-        Text(device.device.name, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+        Text(
+          device.device.name,
+          fontWeight = FontWeight.SemiBold,
+          color = if (device.device.requiresEvidence) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
+          maxLines = 1,
+          overflow = TextOverflow.Ellipsis,
+          modifier = Modifier.weight(1f),
+        )
+        if (!device.device.requiresEvidence) {
+          Spacer(Modifier.width(8.dp))
+          StatusBadge(text = "无法取证", foreground = Warning, background = WarningSoft)
+        }
         if (device.missingKeyScreenshotCount > 0) {
           Icon(Icons.Default.Error, contentDescription = "缺少关键截图", tint = Danger, modifier = Modifier.size(18.dp))
         }
@@ -725,7 +704,12 @@ fun DeviceScreen(
         modifier = Modifier.fillMaxSize().padding(padding),
         contentPadding = PaddingValues(bottom = 96.dp),
       ) {
-        item { DeviceProgressHeader(current) }
+        item {
+          DeviceProgressHeader(
+            device = current,
+            onRequiresEvidenceChange = { viewModel.setDeviceRequiresEvidence(deviceId, it) },
+          )
+        }
         items(current.orderedItems, key = { it.item.id }) { evidence ->
           EvidenceRow(
             evidence = evidence,
@@ -819,7 +803,7 @@ private fun DeleteConfirmationDialog(
 }
 
 @Composable
-private fun DeviceProgressHeader(device: DeviceWithItems) {
+private fun DeviceProgressHeader(device: DeviceWithItems, onRequiresEvidenceChange: (Boolean) -> Unit) {
   val progress = if (device.totalCount == 0) 0f else device.recordedCount.toFloat() / device.totalCount
   Column(modifier = Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(16.dp)) {
     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -833,6 +817,20 @@ private fun DeviceProgressHeader(device: DeviceWithItems) {
       color = if (progress >= 1f) Success else MaterialTheme.colorScheme.primary,
       trackColor = LocalEvidenceColors.current.progressTrackSecondary,
     )
+    Row(
+      modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
+      verticalAlignment = Alignment.CenterVertically,
+    ) {
+      Column(modifier = Modifier.weight(1f)) {
+        Text("本设备需要取证", fontWeight = FontWeight.Medium)
+        Text(
+          "关闭后仅隐藏缺关键截图提醒，不影响取证进度",
+          style = MaterialTheme.typography.bodySmall,
+          color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+      }
+      Switch(checked = device.device.requiresEvidence, onCheckedChange = onRequiresEvidenceChange)
+    }
     if (device.missingKeyScreenshotCount > 0) {
       Spacer(Modifier.height(9.dp))
       Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1104,6 +1102,16 @@ fun EvidenceItemScreen(
           shape = CardShape,
         )
       }
+      if (current.item.verificationMethod.isNotBlank()) {
+        Spacer(Modifier.height(10.dp))
+        Column(modifier = Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(16.dp)) {
+          Text("核查方式", fontWeight = FontWeight.SemiBold)
+          Spacer(Modifier.height(10.dp))
+          SelectionContainer {
+            Text(current.item.verificationMethod, style = MaterialTheme.typography.bodyMedium)
+          }
+        }
+      }
     }
   }
 }
@@ -1253,32 +1261,5 @@ private fun formatTime(timestamp: Long): String =
   DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
     .withZone(ZoneId.systemDefault())
     .format(Instant.ofEpochMilli(timestamp))
-
-private fun wordDocumentFileName(projectName: String): String {
-  val safeName = projectName.trim().replace(Regex("[\\\\/:*?\"<>|]"), "_").ifBlank { "项目" }
-  return "${safeName}_关键设备截图.docx"
-}
-
-private const val DOCX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-private const val ZIP_MIME_TYPE = "application/zip"
-
-private fun createFileInDefaultTree(
-  context: Context,
-  treeUri: Uri?,
-  mimeType: String,
-  fileName: String,
-): Uri? = treeUri?.let { uri ->
-  runCatching {
-    DocumentFile.fromTreeUri(context, uri)
-      ?.takeIf { directory -> directory.isDirectory && directory.canWrite() }
-      ?.createFile(mimeType, fileName)
-      ?.uri
-  }.getOrNull()
-}
-
-private fun projectPackageFileName(projectName: String): String {
-  val safeName = projectName.trim().replace(Regex("[\\\\/:*?\"<>|]"), "_").ifBlank { "项目" }
-  return "${safeName}_导出包.zip"
-}
 
 private enum class DefaultExportTarget { PROJECT_PACKAGE, WORD }

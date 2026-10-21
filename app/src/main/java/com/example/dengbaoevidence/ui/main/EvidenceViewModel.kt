@@ -19,6 +19,16 @@ import com.example.dengbaoevidence.data.TemplateConflictStrategy
 import com.example.dengbaoevidence.data.TemplateImportPreview
 import com.example.dengbaoevidence.data.TemplateTransfer
 import com.example.dengbaoevidence.data.WordExporter
+import com.example.dengbaoevidence.data.WordTemplateStore
+import com.example.dengbaoevidence.data.BackupArchiveWriter
+import com.example.dengbaoevidence.data.BackupSpaceEstimator
+import com.example.dengbaoevidence.data.BackupSpacePreview
+import com.example.dengbaoevidence.data.BackupStorage
+import com.example.dengbaoevidence.data.BackupStorageGuard
+import com.example.dengbaoevidence.data.ExportFileIo
+import com.example.dengbaoevidence.data.createChildTree
+import com.example.dengbaoevidence.data.createFileTree
+import androidx.documentfile.provider.DocumentFile
 import java.io.File
 import java.security.MessageDigest
 import java.util.UUID
@@ -33,6 +43,10 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 
 enum class SaveStatus {
   IDLE,
@@ -40,6 +54,12 @@ enum class SaveStatus {
   SAVED,
   FAILED,
 }
+
+enum class ExportKind { TEMPLATES, BACKUP, WORD, PROJECT_PACKAGE }
+
+data class ExportProgress(val kind: ExportKind, val projectId: Long?, val percent: Int, val message: String)
+
+data class BackupPreflight(val directory: Uri, val useSubdirectory: Boolean, val space: BackupSpacePreview? = null)
 
 class EvidenceViewModel(private val repository: DataRepository) : ViewModel() {
   val projects: StateFlow<List<ProjectSummary>> =
@@ -53,6 +73,45 @@ class EvidenceViewModel(private val repository: DataRepository) : ViewModel() {
 
   private val _errorMessage = MutableStateFlow<String?>(null)
   val errorMessage: StateFlow<String?> = _errorMessage.asStateFlow()
+
+  private val _exportProgress = MutableStateFlow<ExportProgress?>(null)
+  val exportProgress: StateFlow<ExportProgress?> = _exportProgress.asStateFlow()
+
+  private val _backupPreflight = MutableStateFlow<BackupPreflight?>(null)
+  val backupPreflight: StateFlow<BackupPreflight?> = _backupPreflight.asStateFlow()
+  private val _backupSuccessMessage = MutableStateFlow<String?>(null)
+  val backupSuccessMessage: StateFlow<String?> = _backupSuccessMessage.asStateFlow()
+  private var backupPreflightJob: Job? = null
+  private val _wordTemplateBusy = MutableStateFlow(false)
+  val wordTemplateBusy = _wordTemplateBusy.asStateFlow()
+  private val _wordTemplateRevision = MutableStateFlow(0)
+  val wordTemplateRevision = _wordTemplateRevision.asStateFlow()
+
+  fun importWordTemplate(context: Context, uri: Uri) {
+    changeWordTemplate { WordTemplateStore.import(context, uri) }
+  }
+
+  fun removeWordTemplate(context: Context) {
+    changeWordTemplate { WordTemplateStore.remove(context) }
+  }
+
+  private fun changeWordTemplate(action: () -> Unit) {
+    if (_wordTemplateBusy.value || _exportProgress.value != null || _backupPreflight.value != null) {
+      _errorMessage.value = "请等待当前导出或模板操作完成"
+      return
+    }
+    _wordTemplateBusy.value = true
+    viewModelScope.launch {
+      try {
+        withContext(Dispatchers.IO) { action() }
+        _wordTemplateRevision.value += 1
+      } catch (error: Exception) {
+        if (error is CancellationException) throw error
+        showError("Word 模板设置失败", error)
+      }
+      finally { _wordTemplateBusy.value = false }
+    }
+  }
 
   private val pendingNotes = mutableMapOf<Long, String>()
   private val noteJobs = mutableMapOf<Long, Job>()
@@ -90,6 +149,7 @@ class EvidenceViewModel(private val repository: DataRepository) : ViewModel() {
   }
 
   fun deleteProject(projectId: Long, onFinished: (Boolean) -> Unit) {
+    if (rejectDeletionDuringExport(onFinished)) return
     viewModelScope.launch {
       runCatching { repository.deleteProject(projectId) }
         .onSuccess { result ->
@@ -153,6 +213,7 @@ class EvidenceViewModel(private val repository: DataRepository) : ViewModel() {
           displayOrder = item.displayOrder,
           isKeyScreenshot = item.isKeyScreenshot,
           wordOrder = item.wordOrder,
+          verificationMethod = item.verificationMethod,
         )
       }.onFailure { showError("修改取证项失败", it) }
     }
@@ -173,24 +234,93 @@ class EvidenceViewModel(private val repository: DataRepository) : ViewModel() {
     }
   }
 
-  fun exportDeviceTypeTemplates(context: Context, destination: Uri, onFinished: (Boolean) -> Unit) {
-    viewModelScope.launch {
-      runCatching {
-        withContext(Dispatchers.IO) {
-          val json = TemplateTransfer.encode(repository.getDeviceTypesSnapshot())
-          requireNotNull(context.contentResolver.openOutputStream(destination, "w")) { "无法写入所选文件" }
-            .bufferedWriter(Charsets.UTF_8)
-            .use { it.write(json) }
+  fun exportDeviceTypeTemplates(context: Context, directory: Uri, useSubdirectory: Boolean = true) {
+    val date = ExportFileIo.dateSuffix()
+    exportToDirectory(
+      context, directory, if (useSubdirectory) "设备类型模板" else null,
+      { "等保取证_设备类型模板_$date.json" }, "application/json", ExportKind.TEMPLATES,
+      produce = { file, progress ->
+        val json = TemplateTransfer.encode(repository.getDeviceTypesSnapshot())
+        file.writeText(json, Charsets.UTF_8)
+        TemplateTransfer.decode(file.readText(Charsets.UTF_8))
+        progress(100, "模板已生成")
+      },
+      successMessage = { "设备类型模板已导出" },
+    )
+  }
+
+  fun prepareBackup(context: Context, directory: Uri, useSubdirectory: Boolean = true) {
+    if (_exportProgress.value != null || _wordTemplateBusy.value) {
+      _errorMessage.value = "已有导出任务，请等待完成"
+      return
+    }
+    backupPreflightJob?.cancel()
+    val pending = BackupPreflight(directory, useSubdirectory)
+    _backupPreflight.value = pending
+    backupPreflightJob = viewModelScope.launch {
+      try {
+        val space = withContext(Dispatchers.IO) {
+          val job = currentCoroutineContext()
+          val (projects, deviceTypes) = repository.getBackupSnapshot()
+          val templates = TemplateTransfer.encode(deviceTypes)
+          val estimate = BackupSpaceEstimator.estimate(projects, templates.toByteArray(Charsets.UTF_8).size.toLong()) {
+            job.ensureActive()
+          }
+          BackupStorage.inspect(context, directory).preview(estimate)
         }
-      }.onSuccess {
-        _errorMessage.value = "设备类型模板已导出"
-        onFinished(true)
-      }.onFailure {
-        runCatching { context.contentResolver.delete(destination, null, null) }
-        showError("设备类型模板导出失败", it)
-        onFinished(false)
+        if (_backupPreflight.value === pending) _backupPreflight.value = pending.copy(space = space)
+      } catch (throwable: Throwable) {
+        if (throwable is CancellationException) throw throwable
+        if (_backupPreflight.value === pending) {
+          _backupPreflight.value = null
+          showError("备份空间检查失败", throwable)
+        }
       }
     }
+  }
+
+  fun cancelBackupPreparation() {
+    backupPreflightJob?.cancel()
+    _backupPreflight.value = null
+  }
+
+  fun confirmBackup(context: Context) {
+    val pending = _backupPreflight.value ?: return
+    if (pending.space?.canStart != true) return
+    _backupPreflight.value = null
+    backupAllData(context, pending.directory, pending.useSubdirectory)
+  }
+
+  private fun backupAllData(context: Context, directory: Uri, useSubdirectory: Boolean) {
+    val date = ExportFileIo.dateSuffix()
+    var storageGuard: BackupStorageGuard? = null
+    exportToDirectory(
+      context, directory, if (useSubdirectory) "数据备份" else null,
+      { "Aster-数据备份-$date.zip" }, "application/zip", ExportKind.BACKUP,
+      beforeSave = { file -> requireNotNull(storageGuard).beforeSave(file) },
+      beforeWrite = { bytes -> requireNotNull(storageGuard).beforeDestinationWrite(bytes) },
+      produce = { file, progress ->
+        progress(0, "正在重新检查备份空间")
+        val job = currentCoroutineContext()
+        val (projects, deviceTypes) = repository.getBackupSnapshot()
+        val templates = TemplateTransfer.encode(deviceTypes)
+        val estimate = BackupSpaceEstimator.estimate(projects, templates.toByteArray(Charsets.UTF_8).size.toLong()) {
+          job.ensureActive()
+        }
+        val guard = BackupStorage.inspect(context, directory).guard(estimate)
+        storageGuard = guard
+        val checkWrite: (Int) -> Unit = { bytes -> job.ensureActive(); guard.beforeInternalWrite(bytes) }
+        BackupArchiveWriter.export(
+          projects, templates, date, file, File(context.cacheDir, "backup_${UUID.randomUUID()}"),
+          exportPackage = { data, target, callback -> ProjectPackageExporter.export(context, data, target, callback, checkWrite) },
+          exportWord = { data, target, callback -> WordExporter.export(context, data, target, callback, checkWrite) },
+          beforeProject = { job.ensureActive(); guard.beforeProject() },
+          beforeWrite = checkWrite,
+          onProgress = progress,
+        )
+      },
+      successMessage = { "数据备份已完成" },
+    )
   }
 
   fun previewTemplateImport(context: Context, source: Uri, onFinished: (TemplateImportPreview?) -> Unit) {
@@ -327,6 +457,7 @@ class EvidenceViewModel(private val repository: DataRepository) : ViewModel() {
   }
 
   fun deletePhoto(photoId: Long, onFinished: (Boolean) -> Unit) {
+    if (rejectDeletionDuringExport(onFinished)) return
     viewModelScope.launch {
       val deleted = runCatching { repository.deletePhoto(photoId) }
         .onFailure { showError("照片删除失败，请重试", it) }
@@ -343,7 +474,15 @@ class EvidenceViewModel(private val repository: DataRepository) : ViewModel() {
     }
   }
 
+  fun setDeviceRequiresEvidence(deviceId: Long, requiresEvidence: Boolean) {
+    viewModelScope.launch {
+      runCatching { repository.setDeviceRequiresEvidence(deviceId, requiresEvidence) }
+        .onFailure { showError("设备取证设置保存失败", it) }
+    }
+  }
+
   fun deleteDevice(deviceId: Long, onFinished: (Boolean) -> Unit) {
+    if (rejectDeletionDuringExport(onFinished)) return
     viewModelScope.launch {
       runCatching { repository.deleteDevice(deviceId) }
         .onSuccess { result ->
@@ -360,85 +499,145 @@ class EvidenceViewModel(private val repository: DataRepository) : ViewModel() {
   fun exportKeyScreenshotsWord(
     projectId: Long,
     context: Context,
-    destination: Uri,
-    onFinished: (Boolean) -> Unit,
+    directory: Uri,
+    useSubdirectory: Boolean = true,
   ) {
-    viewModelScope.launch {
-      val result = runCatching {
-        withContext(Dispatchers.IO) {
-          val temporaryDocument = File(context.cacheDir, "word_export_${UUID.randomUUID()}.docx")
-          try {
-            val summary = WordExporter.export(context, repository.getProjectExportData(projectId), temporaryDocument)
-            requireNotNull(context.contentResolver.openOutputStream(destination, "w")) { "无法写入所选文件" }.use { output ->
-              temporaryDocument.inputStream().buffered().use { input -> input.copyTo(output) }
-            }
-            summary
-          } catch (throwable: Throwable) {
-            runCatching { context.contentResolver.delete(destination, null, null) }
-            throw throwable
-          } finally {
-            temporaryDocument.delete()
-          }
+    var name = "项目"
+    val date = ExportFileIo.dateSuffix()
+    exportToDirectory(
+      context, directory, if (useSubdirectory) "Word关键截图" else null,
+      { "${ExportFileIo.safeName(name)}_关键设备截图_$date.docx" },
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document", ExportKind.WORD, projectId,
+      produce = { file, progress ->
+        val data = repository.getProjectExportData(projectId)
+        name = data.project.name
+        WordExporter.export(context, data, file, progress)
+      },
+      successMessage = { summary ->
+        if (summary.photoCount == 0) {
+          "Word 已导出，当前项目没有可插入的关键截图"
+        } else {
+          "Word 已导出：${summary.deviceCount} 台设备，${summary.photoCount} 张图片"
         }
-      }
-      result
-        .onSuccess { summary ->
-          _errorMessage.value = if (summary.photoCount == 0) {
-            "Word 已导出，当前项目没有可插入的关键截图"
-          } else {
-            "Word 已导出：${summary.deviceCount} 台设备，${summary.photoCount} 张图片"
-          }
-          onFinished(true)
-        }
-        .onFailure {
-          showError("Word 导出失败", it)
-          onFinished(false)
-        }
-    }
+      },
+    )
   }
 
   fun exportProjectPackage(
     projectId: Long,
     context: Context,
-    destination: Uri,
-    onFinished: (Boolean) -> Unit,
+    directory: Uri,
+    useSubdirectory: Boolean = true,
   ) {
+    var name = "项目"
+    val date = ExportFileIo.dateSuffix()
+    exportToDirectory(
+      context, directory, if (useSubdirectory) "PC浏览包" else null,
+      { "${ExportFileIo.safeName(name)}_浏览包_$date.zip" }, "application/zip", ExportKind.PROJECT_PACKAGE, projectId,
+      produce = { file, progress ->
+        val data = repository.getProjectExportData(projectId)
+        name = data.project.name
+        ProjectPackageExporter.export(context, data, file, progress)
+      },
+      successMessage = { summary -> "项目浏览包已导出：${summary.deviceCount} 台设备，${summary.photoCount} 张照片" },
+    )
+  }
+
+  fun reportExportLocationError() {
+    _errorMessage.value = "无法取得该目录的读写权限，请重新选择保存位置"
+  }
+
+  private fun rejectDeletionDuringExport(onFinished: (Boolean) -> Unit): Boolean {
+    if (_exportProgress.value == null && _backupPreflight.value == null) return false
+    _errorMessage.value = "正在检查备份或导出，为保护照片完整性，请完成或取消后再删除"
+    onFinished(false)
+    return true
+  }
+
+  private fun <T> exportToDirectory(
+    context: Context,
+    directory: Uri,
+    childDirectory: String?,
+    fileName: () -> String,
+    mimeType: String,
+    kind: ExportKind,
+    projectId: Long? = null,
+    beforeSave: (File) -> Unit = {},
+    beforeWrite: (Int) -> Unit = {},
+    produce: suspend (File, (Int, String) -> Unit) -> T,
+    successMessage: (T) -> String,
+  ) {
+    if (_exportProgress.value != null || _backupPreflight.value != null || _wordTemplateBusy.value) {
+      _errorMessage.value = "已有导出或备份确认任务，请完成或取消后重试"
+      return
+    }
+    _exportProgress.value = ExportProgress(kind, projectId, 0, "正在准备导出")
     viewModelScope.launch {
-      val result = runCatching {
-        withContext(Dispatchers.IO) {
-          val temporaryPackage = File(context.cacheDir, "project_export_${UUID.randomUUID()}.zip")
+      var destination: Uri? = null
+      val temporaryFile = File(context.cacheDir, "export_${UUID.randomUUID()}.tmp")
+      try {
+        // Save pending edits before taking the export snapshot; never silently omit unsaved notes.
+        pendingNotes.toMap().forEach { (itemId, note) ->
+          noteJobs.remove(itemId)?.cancel()
           try {
-            val summary = ProjectPackageExporter.export(
-              context = context,
-              data = repository.getProjectExportData(projectId),
-              destination = temporaryPackage,
-            )
-            requireNotNull(context.contentResolver.openOutputStream(destination, "w")) { "无法写入所选文件" }.use { output ->
-              temporaryPackage.inputStream().buffered().use { input -> input.copyTo(output) }
-            }
-            summary
+            repository.updateNote(itemId, note)
           } catch (throwable: Throwable) {
-            runCatching { context.contentResolver.delete(destination, null, null) }
+            setStatus(itemId, SaveStatus.FAILED)
             throw throwable
-          } finally {
-            temporaryPackage.delete()
+          }
+          if (pendingNotes[itemId] == note) {
+            pendingNotes.remove(itemId)
+            setStatus(itemId, SaveStatus.SAVED)
           }
         }
+        val result = withContext(Dispatchers.IO) {
+          val job = currentCoroutineContext()
+          fun progress(percent: Int, message: String) {
+            job.ensureActive()
+            val previous = _exportProgress.value?.percent ?: 0
+            _exportProgress.value = ExportProgress(kind, projectId, maxOf(previous, percent.coerceIn(0, 100)), message)
+          }
+          val summary = produce(temporaryFile) { value, message -> progress(value.coerceIn(0, 100) * 75 / 100, message) }
+          beforeSave(temporaryFile)
+          val targetDirectory = if (childDirectory == null) directory else {
+            requireNotNull(createChildTree(context, directory, childDirectory)) { "无法创建导出子目录，请检查权限" }
+          }
+          destination = requireNotNull(createFileTree(context, targetDirectory, fileName(), mimeType)) { "无法创建新导出文件，请检查权限" }
+          val target = requireNotNull(destination)
+          ExportFileIo.copyAndVerify(
+            temporaryFile,
+            openOutput = { requireNotNull(context.contentResolver.openOutputStream(target, "wt")) { "无法写入保存位置" } },
+            openInput = { requireNotNull(context.contentResolver.openInputStream(target)) { "无法回读保存文件" } },
+            beforeWrite = beforeWrite,
+            onProgress = { value, message -> progress(75 + value * 25 / 100, message) },
+          )
+          summary
+        }
+        val message = successMessage(result)
+        if (kind == ExportKind.BACKUP) _backupSuccessMessage.value = message
+        else _errorMessage.value = message
+      } catch (throwable: Throwable) {
+        val cleaned = withContext(NonCancellable + Dispatchers.IO) {
+          destination?.let { uri ->
+            runCatching { DocumentFile.fromSingleUri(context, uri)?.delete() == true }.getOrDefault(false)
+          } ?: true
+        }
+        val suffix = if (cleaned) "" else "；未能清理本次不完整文件，请手动删除，不要作为有效备份使用"
+        showError("导出失败", IllegalStateException("${throwable.message ?: "未知错误"}$suffix", throwable))
+        if (throwable is CancellationException) throw throwable
+      } finally {
+        withContext(NonCancellable + Dispatchers.IO) { temporaryFile.delete() }
+        _exportProgress.value = null
       }
-      result
-        .onSuccess { summary ->
-          _errorMessage.value = "项目浏览包已导出：${summary.deviceCount} 台设备，${summary.photoCount} 张照片"
-          onFinished(true)
-        }
-        .onFailure {
-          showError("项目浏览包导出失败", it)
-          onFinished(false)
-        }
     }
   }
 
   fun clearError() {
     _errorMessage.value = null
+  }
+
+  fun clearBackupSuccessMessage() {
+    _backupSuccessMessage.value = null
   }
 
   private suspend fun persistNote(itemId: Long, note: String) {

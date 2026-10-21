@@ -52,6 +52,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -82,6 +83,8 @@ fun PhotoViewerScreen(
   var scale by remember { mutableFloatStateOf(1f) }
   var offsetX by remember { mutableFloatStateOf(0f) }
   var offsetY by remember { mutableFloatStateOf(0f) }
+  var viewportWidth by remember { mutableIntStateOf(0) }
+  var viewportHeight by remember { mutableIntStateOf(0) }
   var pendingDownloadPath by rememberSaveable(itemId) { mutableStateOf<String?>(null) }
   var isDownloading by remember { mutableStateOf(false) }
   var isDeleting by remember { mutableStateOf(false) }
@@ -116,8 +119,10 @@ fun PhotoViewerScreen(
     val updatedScale = (scale * zoomChange).coerceIn(1f, 5f)
     scale = updatedScale
     if (updatedScale > 1f) {
-      offsetX += panChange.x
-      offsetY += panChange.y
+      val maxX = viewportWidth * (updatedScale - 1f) / 2f
+      val maxY = viewportHeight * (updatedScale - 1f) / 2f
+      offsetX = (offsetX + panChange.x).coerceIn(-maxX, maxX)
+      offsetY = (offsetY + panChange.y).coerceIn(-maxY, maxY)
     } else {
       offsetX = 0f
       offsetY = 0f
@@ -158,11 +163,9 @@ fun PhotoViewerScreen(
         contentScale = ContentScale.Fit,
         modifier = Modifier
           .fillMaxSize()
-          .graphicsLayer {
-            scaleX = scale
-            scaleY = scale
-            translationX = offsetX
-            translationY = offsetY
+          .onSizeChanged {
+            viewportWidth = it.width
+            viewportHeight = it.height
           }
           .transformable(transformState)
           .pointerInput(photo.id) {
@@ -177,7 +180,13 @@ fun PhotoViewerScreen(
                 }
               },
             )
-          },
+          }
+          .graphicsLayer {
+            scaleX = scale
+            scaleY = scale
+            translationX = offsetX
+            translationY = offsetY
+          }
       )
     }
 
