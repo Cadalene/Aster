@@ -63,6 +63,7 @@ class ProjectPackageExporterTest {
               name = "防火墙01",
               typeName = "防火墙",
               createdAt = 1_700_000_001_000,
+              requiresEvidence = false,
             ),
             items = listOf(item),
           ),
@@ -88,6 +89,10 @@ class ProjectPackageExporterTest {
         val dataScript = zip.getInputStream(zip.getEntry("data.js")).bufferedReader().use { it.readText() }
         val exportedData = JSONObject(dataScript.removePrefix("window.EVIDENCE_EXPORT = ").trim().removeSuffix(";"))
         assertEquals("测试项目", exportedData.getJSONObject("project").getString("name"))
+        assertEquals(
+          false,
+          exportedData.getJSONArray("devices").getJSONObject(0).getBoolean("requiresEvidence"),
+        )
         assertTrue(
           exportedData.getJSONArray("devices").getJSONObject(0)
             .getJSONArray("items").getJSONObject(0)
